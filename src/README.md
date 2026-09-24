@@ -43,11 +43,11 @@ const key = await crypto.subtle.importKey("raw", bin("VFe64Kavy2H5XWPYAWVJaA==")
 let pt = new Uint8Array(await crypto.subtle.decrypt({ name: "AES-GCM", iv: bin(body.slice(0, dot)) }, key, bin(body.slice(dot + 1))));
 pt = new Uint8Array(await new Response(new Blob([pt]).stream().pipeThrough(new DecompressionStream("gzip"))).arrayBuffer());
 await fs.writeTextFile("scratch/history.md", new TextDecoder().decode(pt));
-return (await fs.readTextFile("scratch/history.md")).length;   // ~1406870 Zeichen (Runde 275)
+return (await fs.readTextFile("scratch/history.md")).length;   // ~1408424 Zeichen (Runde 276)
 ```
 
 **HISTORY_URL** (Runde 274, gültig bis zum nächsten Neu-Packen):
-`https://user.uploads.dev/file/d17850d4069bb17475f24c1adb2eef2b.bin`
+`https://user.uploads.dev/file/70ce159c39f9421debac264835c1cf59.bin`
 
 Und die vollständige README-Fassung (dieselbe Verschlüsselung **nicht** — nur gzip):
 `src/docs/README-full.md.gz` (im Haus; die gehostete Zweitfassung steht in der Kopfzeile):
@@ -1126,3 +1126,52 @@ C'est pourquoi le miroir reste un **secours**, pas l'adresse principale.
 `src/build.json` (**v275**), `src/README.md`, `src/KNOWLEDGE.md`. **`main.pjs` inchangé.**
 
 Abschluss dieser Runde: `src/build.json` steht auf **v275**.
+
+## 174. Ronde 276 – le miroir est en ligne (2026-09-24)
+
+Le dépôt **`github.com/Sofiaperchance/Sofia`** (public) contient maintenant les **217 fichiers** du
+miroir, avec l'arborescence exacte (`src/droit/…`, `src/python/…`). L'adresse de secours, telle
+qu'elle est inscrite dans le champ `mirror` de `src/remote.json` :
+
+`https://cdn.jsdelivr.net/gh/Sofiaperchance/Sofia@main/`
+
+— le chemin logique est simplement accroché derrière (`…@main/src/python/py-zeste-types.json.gz`).
+`@main` suit le dépôt tout seul ; pour figer une version, écrire `@<commit>` à la place.
+
+### Comment le dépôt a été rempli
+
+Les envois manuels ont échoué deux fois : GitHub refuse **plus de 100 fichiers d'un coup**, et le
+second essai est arrivé **à plat** (tous les fichiers à la racine, `articles (2).json.gz`…), les
+dossiers ayant été perdus au passage. Le propriétaire a donc créé un **jeton fin** (7 jours,
+`Contents: Read and write`, limité à ce seul dépôt) : les 217 fichiers ont été poussés par l'API
+GitHub en **un seul commit** (217 blobs + un arbre + une référence), ce qui a remplacé du même coup
+les 224 fichiers parasites. Le jeton a été révoqué juste après.
+
+### Vérifié en direct
+
+- jsDelivr et `raw.githubusercontent.com` servent les `.gz` tels quels (aucun `Content-Encoding`
+  parasite) : la fiche `py-zeste-types` se décompresse en 45 sections, `src/remote.json` arrive
+  entier (157 entrées).
+- **Le secours a été essayé pour de vrai** : trois adresses principales cassées volontairement (une
+  fiche de maths, une fiche de python, la carte des numéros du droit). La page a continué de charger
+  avec l'avertissement `[LoadJson] … HTTP 404 — essai du miroir : …`, les mémos sont restés à
+  **173/4** et **1060/46**, la carte à **68 661 entrées**, servis par GitHub et mémorisés pour la
+  session (`_remHit`). Les tables ont ensuite été remises en état (0 adresse cassée).
+
+### Entretien
+
+- Rien à faire au quotidien : le miroir n'est lu **que** si `user.uploads.dev` ne répond pas.
+- Quand la documentation est repackée, le dépôt en garde une copie ancienne : sans importance pour
+  l'application (c'est une sauvegarde), mais si on veut le tenir à jour il suffit d'y remplacer
+  `src/docs/history.enc` et `src/README.md` ; en poussant un nouveau commit, mieux vaut alors figer
+  `@<commit>` et mettre à jour le champ `mirror`.
+- Une **nouvelle** fiche de domaine reçoit, comme avant, son entrée dans la table `files` de
+  `src/remote.json`. Pour qu'elle ait aussi un secours, il faut la déposer dans le dépôt au même
+  chemin logique — sinon elle n'aura pas de miroir (le secours est par fichier, jamais bloquant).
+- Le dépôt est public, comme les fichiers qu'il contient : rien de secret ne doit y entrer.
+
+**Fichiers.** `src/remote.json` (champ `mirror`), `src/build.json` (**v276**), `src/README.md`,
+`src/KNOWLEDGE.md`, `src/docs/history.enc` (hébergé, adresse en §1). **`index.html` et `main.pjs`
+inchangés cette ronde.**
+
+Abschluss dieser Runde: `src/build.json` steht auf **v276**.

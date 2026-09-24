@@ -1315,3 +1315,25 @@ alles andere unverändert, `SelfUpdate.verify()` 48 Dateien / 0 verändert, `bui
 **Ehrliche Einschränkung.** `raw.githubusercontent.com` ist kein CDN (manche Netze blocken es),
 jsDelivr begrenzt auf 20 MB pro Datei; ein öffentliches Repo macht die Korpora für jeden lesbar
 (sie sind es ohnehin schon). Der Spiegel bleibt deshalb **Reserve**, nicht Hauptadresse.
+
+## 45. Nachtrag (Runde 276): das Miroir ist online (GitHub) (2026-09-24)
+
+`github.com/Sofiaperchance/Sofia` (öffentlich) trägt jetzt die **217 Miroir-Dateien** in der exakten
+Baumstruktur (`src/droit/…`, `src/python/…`). Die Adresse steht im Feld `mirror` von
+`src/remote.json`: `https://cdn.jsdelivr.net/gh/Sofiaperchance/Sofia@main/` — der logische Pfad wird
+einfach angehängt (`@main` folgt dem Repo; `@<commit>` friert eine Fassung ein).
+
+**Wie es gefüllt wurde.** Zwei manuelle Versuche des Eigentümers scheiterten: GitHub lehnt **mehr als
+100 Dateien pro Zug** ab, und der zweite Versuch kam **flach** an (alles im Wurzelverzeichnis, mit
+„(2)"-Suffixen, weil die Ordner beim Ziehen verloren gingen). Mit einem feinen **Token** des
+Eigentümers (7 Tage, `Contents: Read and write`, nur dieses Repo) wurden die 217 Dateien über die
+GitHub-API in **einem** Commit gepusht (217 Blobs, ein Tree, eine Referenz) — womit zugleich die 224
+überflüssigen Dateien verschwanden. Das Token wurde danach widerrufen.
+
+**Geprüft (live).** jsDelivr und raw liefern die `.gz` unverändert (kein `Content-Encoding`-Fallstrick:
+`py-zeste-types` → 45 Sektionen, `src/remote.json` → 157 Einträge). Der Notausgang wurde echt
+getestet: drei Hauptadressen wurden gekappt (Mathe-Fiche, Python-Fiche, Nummernkarte des Rechts) — die
+Seite lud weiter mit der Warnung `[LoadJson] … HTTP 404 — essai du miroir : …`, die Memos blieben bei
+**173/4** und **1060/46**, die Nummernkarte bei **68 661**, alles über GitHub geholt und für die
+Sitzung gemerkt; danach wurden die Tabellen wiederhergestellt (0 kaputte Adressen). `src/` bleibt
+2,32 MB / 91 Dateien, `build.json` **v276**.
