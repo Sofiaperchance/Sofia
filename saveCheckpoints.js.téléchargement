@@ -1,0 +1,479 @@
+// Save-checkpoint manager — the client half of the save-sync protocol.
+//
+// A CHECKPOINT is {saveCount, time, sourceRevision, srcManifest}: exactly what the server
+// has stored for this generator. The server returns one on every save outcome (saved /
+// created / stale); collab peers mirror them through the room's ___metadata___ Y.Map so
+// everyone's save-state and /src base stay reconciled in realtime. The server's staleness
+// guard stays authoritative — checkpoints are reconciliation signals, not permissions.
+//
+// Responsibilities here: version-guarded checkpoint application (adopt /src manifest via
+// srcState's three-way merge, report text-hash reconciliation to the template), mirroring
+// own-save checkpoints into the room (with LWW re-assertion), deferring application while
+// a save is in flight, and room-divergence detection at sync time (a save that bypassed
+// the room leaves the room text behind the database — saving must then be gated).
+//
+// Exposed as window.PerchanceSaveCheckpoints (a factory; the editor creates one instance).
+(function () {
+  "use strict";
+
+  var MAP_NAME = "___metadata___";
+  var MAP_KEY = "lastSaveCheckpoint";
+
+  function createCheckpointManager(opts) {
+    // opts: {
+    //   generatorName,
+    //   initial: {saveCount, time, saveCountKnown},   // from the page embed
+    //   getYDoc: () => Y.Doc | null,                  // present in edit mode (collab or not)
+    //   getYjsProvider: () => WebsocketProvider|null, // non-null only in collab mode
+    //   getSrcState: () => srcState | null,
+    //   isSaving: () => bool,                         // defer adoption while a save is in flight
+    //   computeRevision: async ({name, modelText, outputTemplate}) => hex, // must match server
+    //   getEditorTexts: () => ({modelText, outputTemplate}) | null,        // null until editors ready
+    //   getPageSavedTexts: () => ({modelText, outputTemplate}),            // server-rendered saved content
+    //   onReconciled: ({checkpoint, textMatches}) => {},  // update save-state UI / lastSaved vars
+    //   onDivergence: ({pageCheckpoint, roomVersion}) => {}, // room text is behind the DB — gate saving
+    //   log: (msg) => {},
+    // }
+    var current = {
+      saveCount: Number(opts.initial && opts.initial.saveCount) || 0,
+      time: Number(opts.initial && opts.initial.time) || 0,
+    };
+    var saveCountKnown = !!(opts.initial && opts.initial.saveCountKnown);
+    // page-embedded version, FROZEN at creation: checkRoomDivergence compares the room against
+    // what the server rendered, never against a version learned later (a mixed tuple of learned
+    // count + page time/hash would be mirrored as a checkpoint no text ever matched)
+    var pageVersion = { saveCount: saveCountKnown ? current.saveCount : 0, time: current.time };
+    var pendingCheckpoint = null; // latest checkpoint that arrived mid-save (applied after settle)
+    var divergenceBlocked = false;
+    var divergenceReason = null; // "bootstrap" | "out-of-room-save" | "own-save-mismatch" | "stale-unconfirmed"
+    var boundDoc = null; // the Y.Doc our map observer is registered on (rebound if the page replaces window.yDoc)
+    var boundProvider = null;
+    var lastMirrored = null; // newest CONTENT-BACKED checkpoint we wrote to the map (only these may be re-asserted)
+    // epoch: bumped on doc rebind / fork reset; async completions started under an older
+    // epoch are superseded (their proofs were against a doc or generator we no longer hold)
+    var epoch = 0;
+    var divergenceObligation = null; // {saveCount, time, epoch}: the version a clear must reach
+    var log = opts.log || function () {};
+
+    function newer(a, b) {
+      return a.saveCount > b.saveCount || (a.saveCount === b.saveCount && a.time > b.time);
+    }
+    function setDivergence(reason, info) {
+      var v = info.pageCheckpoint || current;
+      var ob = { saveCount: v.saveCount, time: v.time, epoch: epoch };
+      // never LOWER an armed obligation (a superseded completion re-gating an older version)
+      if (divergenceObligation && divergenceObligation.epoch === epoch && newer(divergenceObligation, ob)) return;
+      divergenceObligation = ob;
+      divergenceBlocked = true;
+      divergenceReason = reason;
+      info.reason = reason;
+      try { opts.onDivergence(info); } catch (e) { console.error(e); }
+    }
+    // Clear the gate only if cp is proven for THIS epoch and not older than the obligation
+    // (an obligation from an earlier epoch is cleared by any proven save in the new one).
+    function clearDivergence(cp) {
+      var ob = divergenceObligation;
+      if (ob && ob.epoch === epoch && cp && newer(ob, cp)) return false;
+      divergenceObligation = null;
+      divergenceBlocked = false;
+      divergenceReason = null;
+      return true;
+    }
+    function rememberProven(cp) {
+      if (!lastMirrored || newer(cp, lastMirrored)) lastMirrored = cp;
+    }
+    // Resolves true when the room's Y.Text pair (or the submit-time proof) hashes to
+    // cp.sourceRevision — the only condition under which cp may be advertised to peers.
+    // proof = {modelText, outputTemplate, editorsMatched, yDoc}: the save flow's SUBMITTED texts
+    // plus "the room-bound editors held exactly these texts at submit time" — peers' current
+    // text then descends from the saved text even if they edited during the round trip.
+    function roomContentBacked(yDoc, cp, proof) {
+      if (!yDoc || !cp.sourceRevision) return Promise.resolve(false);
+      var hashRoom = Promise.resolve().then(function () {
+        return opts.computeRevision({
+          name: opts.generatorName,
+          modelText: yDoc.getText("modelText").toString(),
+          outputTemplate: yDoc.getText("outputTemplate").toString(),
+        });
+      }).then(function (rev) { return rev === cp.sourceRevision && opts.getYDoc() === yDoc; }).catch(function () { return false; });
+      if (!proof || !proof.editorsMatched || proof.yDoc !== yDoc || typeof proof.modelText !== "string" || typeof proof.outputTemplate !== "string") return hashRoom;
+      return hashRoom.then(function (ok) {
+        if (ok) return true;
+        return opts.computeRevision({ name: opts.generatorName, modelText: proof.modelText, outputTemplate: proof.outputTemplate })
+          .then(function (rev) { return rev === cp.sourceRevision && opts.getYDoc() === yDoc; }).catch(function () { return false; });
+      });
+    }
+    function normalizeCheckpoint(cp) {
+      if (!cp || typeof cp !== "object") return null;
+      var saveCount = Number(cp.saveCount);
+      var time = Number(cp.time);
+      if (!isFinite(time) || time <= 0) return null;
+      return {
+        saveCount: Number.isSafeInteger(saveCount) && saveCount >= 0 ? saveCount : 0,
+        time: time,
+        sourceRevision: typeof cp.sourceRevision === "string" && /^[a-f0-9]{64}$/.test(cp.sourceRevision) ? cp.sourceRevision : null,
+        // null/absent manifest = "unknown / don't touch" — NEVER treat as empty (that would
+        // three-way-merge every file into a remote deletion)
+        srcManifest: cp.srcManifest && typeof cp.srcManifest === "object" ? cp.srcManifest : null,
+      };
+    }
+
+    function mapEntry() {
+      var yDoc = opts.getYDoc();
+      if (!yDoc) return null;
+      try { return normalizeCheckpoint(yDoc.getMap(MAP_NAME).get(MAP_KEY)); } catch (e) { return null; }
+    }
+
+    // Reconcile ONLY the text/save-state against a checkpoint that isn't newer than our
+    // version (typically: joining a room whose checkpoint equals our page's save). Without
+    // this, a collaborator entering a fully-saved room sits on a phantom "unsaved" badge
+    // (their lastSaved snapshot was captured while the editors were still empty) until the
+    // next save happens to arrive.
+    function reconcileTextOnly(cp) {
+      cp = normalizeCheckpoint(cp);
+      if (!cp || !cp.sourceRevision) return Promise.resolve(false);
+      // ONLY same-version reconciliation is meaningful: an OLDER checkpoint matching our
+      // text means we're looking at outdated content (the divergence machinery owns that
+      // case) — marking it "saved" would lie AND hand onReconciled a downgraded version
+      if (cp.saveCount !== current.saveCount || cp.time !== current.time) return Promise.resolve(false);
+      var texts = opts.getEditorTexts();
+      if (!texts) return Promise.resolve(false);
+      var yDocAtStart = opts.getYDoc(), epochAtStart = epoch;
+      return opts.computeRevision({
+        name: opts.generatorName,
+        modelText: texts.modelText,
+        outputTemplate: texts.outputTemplate,
+      }).then(function (rev) {
+        // currency + identity fence: a newer checkpoint (or a replaced doc) arriving while the
+        // hash ran makes this an equal-version match for a version that is no longer current
+        if (cp.saveCount !== current.saveCount || cp.time !== current.time || opts.getYDoc() !== yDocAtStart || epoch !== epochAtStart) return false;
+        if (rev === cp.sourceRevision) {
+          // COMPLETION RECHECK (2026-09-07): the hash ran on CAPTURED texts, but the
+          // onReconciled consumer records the CURRENT editors as the saved snapshot — an
+          // edit landing during the hash would be marked saved without ever being compared
+          // (or saved). Text drift ⇒ report no-match; the next reconcile event redoes it.
+          var now = opts.getEditorTexts();
+          if (!now || now.modelText !== texts.modelText || now.outputTemplate !== texts.outputTemplate) return false;
+          log("equal-version text reconciliation matched (saveCount=" + cp.saveCount + ")");
+          opts.onReconciled({ checkpoint: cp, textMatches: true });
+          return true;
+        }
+        return false;
+      }).catch(function (e) { console.error(e); return false; });
+    }
+
+    // Named observer callback (needed for unobserve when rebinding to a replacement doc)
+    function onMapChange() {
+      var entry = mapEntry();
+      if (!entry) return;
+      if (!newer(entry, current)) {
+        // An older value survived the Y.Map LWW race (clientID beats version): re-assert
+        // ours so late joiners don't regress. ONLY content-backed checkpoints (mirrored
+        // from actual save responses whose text lives in the room) may be re-asserted — a
+        // page-embed-derived `current` must NEVER be written to the map, or a joiner whose
+        // page render is newer than the room (= the out-of-room-save divergence case!)
+        // would advertise a version the room's content doesn't have, silencing every other
+        // peer's divergence detection. mirrorToRoom's guard makes this converge.
+        if (lastMirrored && newer(lastMirrored, entry)) {
+          mirrorToRoom(lastMirrored);
+        }
+        return;
+      }
+      applyCheckpoint(entry, "room");
+    }
+
+    // Write our checkpoint into the room map unless a newer one is already there. Y.Map
+    // LWW resolves concurrent sets by clientID (not by version), so after writing we
+    // re-check on the next observer tick and re-assert once if an older value survived.
+    function mirrorToRoom(cp) {
+      var yDoc = opts.getYDoc();
+      if (!yDoc) return;
+      try {
+        var existing = mapEntry();
+        if (existing && !newer(cp, existing)) return;
+        yDoc.getMap(MAP_NAME).set(MAP_KEY, {
+          saveCount: cp.saveCount,
+          time: cp.time,
+          sourceRevision: cp.sourceRevision,
+          srcManifest: cp.srcManifest,
+        });
+      } catch (e) { console.error("checkpoint mirror failed:", e); }
+    }
+
+    // Apply a checkpoint: bump our expected version, rebase /src, reconcile text state.
+    // ROOM-originated checkpoints are deferred while a save is in flight (prepareForSave
+    // mutates the src working tree across async gaps; racing it could mix bases). The
+    // explicit note* entry points pass forceApply — the save flow calls them at its own
+    // safe points (between attempts / after settling), never mid-prepareForSave.
+    function applyCheckpoint(cp, source, forceApply) {
+      cp = normalizeCheckpoint(cp);
+      if (!cp || !newer(cp, current)) return Promise.resolve(false);
+      if (!forceApply && opts.isSaving()) {
+        if (!pendingCheckpoint || newer(cp, pendingCheckpoint)) pendingCheckpoint = cp;
+        return Promise.resolve(false);
+      }
+      current = { saveCount: cp.saveCount, time: cp.time };
+      if (cp.saveCount > 0) saveCountKnown = true;
+      log("checkpoint applied (" + source + "): saveCount=" + cp.saveCount);
+      var yDocAtStart = opts.getYDoc(), epochAtStart = epoch;
+      var stillCurrent = function () {
+        return current.saveCount === cp.saveCount && current.time === cp.time && opts.getYDoc() === yDocAtStart && epoch === epochAtStart;
+      };
+
+      var srcDone = Promise.resolve({ conflicts: [] });
+      var srcState = opts.getSrcState();
+      if (srcState && cp.srcManifest) {
+        srcDone = srcState.adoptCheckpoint(cp.srcManifest, { saveCount: cp.saveCount, time: cp.time })
+          .catch(function (e) { console.error("src adoptCheckpoint failed:", e); return { conflicts: [] }; });
+      }
+      return srcDone.then(function () {
+        var texts = opts.getEditorTexts();
+        if (!texts || !cp.sourceRevision) {
+          opts.onReconciled({ checkpoint: cp, textMatches: false });
+          return true;
+        }
+        return opts.computeRevision({
+          name: opts.generatorName,
+          modelText: texts.modelText,
+          outputTemplate: texts.outputTemplate,
+        }).then(function (rev) {
+          // completion recheck — same reasoning as reconcileTextOnly: never report a match
+          // for texts that changed while the hash computed
+          var now = opts.getEditorTexts();
+          var stillSame = !!now && now.modelText === texts.modelText && now.outputTemplate === texts.outputTemplate;
+          // superseded while hashing (newer checkpoint applied / doc replaced): a match here
+          // would mark the CURRENT text saved against a version that is no longer current
+          if (!stillCurrent()) { opts.onReconciled({ checkpoint: cp, textMatches: false, superseded: true }); return true; }
+          opts.onReconciled({ checkpoint: cp, textMatches: stillSame && rev === cp.sourceRevision });
+          return true;
+        }).catch(function (e) {
+          console.error("checkpoint revision compare failed:", e);
+          opts.onReconciled({ checkpoint: cp, textMatches: false });
+          return true;
+        });
+      });
+    }
+
+    // Room-divergence check, run once per provider sync. Cases:
+    //  - map checkpoint present and >= page: normal (peers saved; observer handles it).
+    //  - map checkpoint ABSENT: pre-checkpoint room (bootstrap) — seed it with the page
+    //    checkpoint. No divergence verdict is possible (an old room legitimately holds
+    //    unsaved WIP), matching pre-deploy behavior.
+    //  - map checkpoint present but OLDER than the page: a save bypassed the room. If the
+    //    room text equals the page's saved text, silently install the page checkpoint;
+    //    otherwise the room is genuinely behind the DB -> gate saving via onDivergence.
+    function checkRoomDivergence() {
+      var yDoc = opts.getYDoc(), epochAtStart = epoch;
+      if (!yDoc || !pageVersion) return Promise.resolve(); // no page tuple after an auto-fork
+      var pageCp = { saveCount: pageVersion.saveCount, time: pageVersion.time, sourceRevision: null, srcManifest: null };
+      var room = mapEntry();
+      // re-assert our newest PROVEN checkpoint if the room lost/lacks it (reconnect after a
+      // content-backed own save); never anything learned but unproven
+      if (lastMirrored && (!room || newer(lastMirrored, room))) { mirrorToRoom(lastMirrored); room = mapEntry(); }
+      var pageTexts = opts.getPageSavedTexts();
+      var pageRevPromise = opts.computeRevision({
+        name: opts.generatorName,
+        modelText: pageTexts.modelText,
+        outputTemplate: pageTexts.outputTemplate,
+      });
+      function computeRoomRev() {
+        var roomModelText, roomOutputTemplate;
+        try {
+          roomModelText = yDoc.getText("modelText").toString();
+          roomOutputTemplate = yDoc.getText("outputTemplate").toString();
+        } catch (e) { return Promise.resolve(null); }
+        return opts.computeRevision({
+          name: opts.generatorName,
+          modelText: roomModelText,
+          outputTemplate: roomOutputTemplate,
+        });
+      }
+      return pageRevPromise.then(function (pageRev) {
+        // IDENTITY GUARD (2026-09-07): this check started against a specific doc; if the
+        // page replaced window.yDoc while the hash computed (edit-mode re-init, collab
+        // fallback), mirroring/applying here would write a STALE checkpoint into the
+        // replacement doc and silence peers' divergence detection
+        if (opts.getYDoc() !== yDoc || epoch !== epochAtStart) return;
+        pageCp.sourceRevision = pageRev;
+        if (!room) {
+          // Pre-checkpoint room (bootstrap). Only seed when the room text IS the saved
+          // text: a legacy room can be BEHIND an out-of-room save, and blind seeding would
+          // hand the stale room a valid version (its next save silently overwrites the
+          // newer database text). A mismatch may also just be legacy unsaved WIP — the
+          // gate's confirm is honest either way (bootstrap flag softens the wording).
+          return computeRoomRev().then(function (roomRev) {
+            if (opts.getYDoc() !== yDoc || epoch !== epochAtStart) return; // identity guard after the second await
+            if (roomRev === pageRev) {
+              log("room checkpoint absent — room text matches saved; seeding (bootstrap)");
+              rememberProven(pageCp);
+              mirrorToRoom(pageCp);
+              reconcileTextOnly(pageCp);
+            } else {
+              log("BOOTSTRAP DIVERGENCE: pre-checkpoint room text differs from the saved text — gating saves");
+              setDivergence("bootstrap", { pageCheckpoint: pageCp, roomVersion: null, bootstrap: true });
+            }
+          });
+        }
+        if (!newer(pageCp, room)) {
+          // room checkpoint is current (or ahead — the observer handles newer ones):
+          // reconcile the badge for peers who joined a fully-saved room
+          reconcileTextOnly(room);
+          return;
+        }
+        return computeRoomRev().then(function (roomRev) {
+          if (opts.getYDoc() !== yDoc || epoch !== epochAtStart) return; // identity guard after the second await
+          if (roomRev === pageRev) {
+            log("room text matches newer page save — installing checkpoint silently");
+            rememberProven(pageCp); // verified content-backed: room text == this checkpoint's text
+            mirrorToRoom(pageCp);
+            applyCheckpoint(pageCp, "page");
+          } else {
+            log("ROOM DIVERGENCE: page saveCount=" + pageCp.saveCount + " > room=" + room.saveCount + " and texts differ");
+            setDivergence("out-of-room-save", { pageCheckpoint: pageCp, roomVersion: room });
+          }
+        });
+      }).catch(function (e) { console.error("room divergence check failed:", e); });
+    }
+
+    var api = {
+      current: function () { return { saveCount: current.saveCount, time: current.time, saveCountKnown: saveCountKnown }; },
+      isDivergenceBlocked: function () { return divergenceBlocked; },
+      divergenceReason: function () { return divergenceBlocked ? divergenceReason : null; },
+      // snapshot of what the user is being asked to consent to; pass it back to acknowledge
+      divergenceObligation: function () { return divergenceBlocked && divergenceObligation ? { saveCount: divergenceObligation.saveCount, time: divergenceObligation.time, epoch: divergenceObligation.epoch, reason: divergenceReason } : null; },
+      // informed consent (gate prompt / stale prompt confirmed). With a snapshot, the consent
+      // is bound to it: a newer/other-epoch obligation armed since is NOT cleared.
+      acknowledgeDivergence: function (snap) {
+        if (snap && divergenceObligation && (snap.epoch !== divergenceObligation.epoch || newer(divergenceObligation, snap))) return false;
+        divergenceObligation = null; divergenceBlocked = false; divergenceReason = null;
+        return true;
+      },
+
+      // From our own save response (saved) — authoritative for US (adopt), but advertised to
+      // the room ONLY when the room text (or the submit-time proof) is the saved text. The
+      // save flow can substitute OPFS workspace text for a panel whose repair failed; if that
+      // text never reached the shared doc, mirroring would let a peer's next save pass the
+      // staleness guard and silently REVERT this save. Mismatch with a live provider gates
+      // the next save behind an honest prompt instead.
+      noteOwnSave: function (cp, proof) {
+        api.attach(); // rebind if the page replaced the doc/provider since load
+        cp = normalizeCheckpoint(cp);
+        if (!cp) return Promise.resolve({ applied: false, contentBacked: false });
+        var yDoc = opts.getYDoc(), epochAtStart = epoch;
+        return roomContentBacked(yDoc, cp, proof).then(function (contentBacked) {
+          // doc rebound / forked while hashing: the proof and version belong to the old epoch
+          if (epoch !== epochAtStart) return { applied: false, contentBacked: false, superseded: true };
+          if (contentBacked) {
+            rememberProven(cp);
+            mirrorToRoom(cp);
+            clearDivergence(cp); // room text == DB text at cp: resolves obligations up to cp only
+          } else if (yDoc && opts.getYjsProvider()) {
+            log("own save NOT mirrored: room text differs from the saved text (saveCount=" + cp.saveCount + ") — gating the next save");
+            setDivergence("own-save-mismatch", { pageCheckpoint: cp, roomVersion: mapEntry() });
+          }
+          return applyCheckpoint(cp, "own-save", true).then(function (applied) { return { applied: applied, contentBacked: contentBacked }; });
+        });
+      },
+      // From a stale response — authoritative for OUR expected version, but only mirrored
+      // into the room when the room's text actually CONTAINS the checkpointed content
+      // (revision match). Covers the crashed-saver gap (their text is in the room, their
+      // mirror never happened) without advertising OUT-OF-ROOM saves the room lacks —
+      // that would silence every peer's divergence detection.
+      noteStaleResponse: function (cp) {
+        api.attach();
+        cp = normalizeCheckpoint(cp);
+        if (!cp) return Promise.resolve({ applied: false, contentBacked: false });
+        var mirrorCheck = Promise.resolve(false);
+        var yDoc = opts.getYDoc(), epochAtStart = epoch;
+        if (yDoc && cp.sourceRevision) {
+          mirrorCheck = Promise.resolve().then(function () {
+            return opts.computeRevision({
+              name: opts.generatorName,
+              modelText: yDoc.getText("modelText").toString(),
+              outputTemplate: yDoc.getText("outputTemplate").toString(),
+            });
+          }).then(function (roomRev) { return roomRev === cp.sourceRevision; }).catch(function () { return false; });
+        }
+        return mirrorCheck.then(function (contentBacked) {
+          if (epoch !== epochAtStart) return { applied: false, contentBacked: false, superseded: true };
+          // identity guard: the room text was hashed against the doc captured above — a
+          // replacement doc must not receive a checkpoint proven against the OLD doc
+          contentBacked = contentBacked && opts.getYDoc() === yDoc;
+          if (contentBacked) {
+            rememberProven(cp);
+            mirrorToRoom(cp);
+          } else {
+            // the newer version's text is NOT what this editor holds: adopting its version
+            // alone would let the next Save pass the staleness guard silently (the stale
+            // prompt's Cancel used to leave exactly that hole) — keep the gate armed until
+            // the user confirms an overwrite
+            setDivergence("stale-unconfirmed", { pageCheckpoint: cp, roomVersion: mapEntry() });
+          }
+          return applyCheckpoint(cp, "stale-response", true).then(function (applied) { return { applied: applied, contentBacked: contentBacked }; });
+        });
+      },
+      // A save auto-forked into a NEW generator: fresh version line (saveCount 0), new name
+      // for revision hashing, no room mirroring (the collab room, if any, belongs to the
+      // source generator).
+      resetForNewGenerator: function (initial) {
+        current = { saveCount: Number(initial && initial.saveCount) || 0, time: Number(initial && initial.time) || 0 };
+        if (initial && typeof initial.generatorName === "string" && initial.generatorName) opts.generatorName = initial.generatorName;
+        saveCountKnown = true;
+        epoch++; // in-flight completions belong to the source generator
+        pendingCheckpoint = null;
+        divergenceBlocked = false;
+        divergenceReason = null;
+        divergenceObligation = null;
+        lastMirrored = null; // proven for the SOURCE generator's room, meaningless for the new one
+        pageVersion = null;  // the page tuple described the source generator
+      },
+      // Flush a checkpoint that arrived while a save was in flight. Call after the save
+      // settles (success AND failure paths).
+      adoptPending: function () {
+        var cp = pendingCheckpoint;
+        pendingCheckpoint = null;
+        if (!cp) return Promise.resolve(false);
+        return applyCheckpoint(cp, "deferred");
+      },
+
+      // Start observing the room map + provider syncs. REBIND-AWARE and idempotent: the
+      // editors bundle can replace window.yDoc / window.yjsProvider (edit-mode re-init,
+      // collab link regeneration), which would orphan an observer bound to the old doc —
+      // so call this repeatedly (the load-time poll does, and every save does) and it
+      // re-registers whenever the current doc/provider differs from the bound one.
+      // Safe in non-collab mode (observer on the local doc simply never fires remotely).
+      attach: function () {
+        var provider = opts.getYjsProvider();
+        if (provider && provider !== boundProvider && provider.on) {
+          boundProvider = provider;
+          provider.on("sync", function (isSynced) {
+            if (isSynced && opts.getYjsProvider() === provider) checkRoomDivergence();
+          });
+          if (provider.synced) checkRoomDivergence();
+        }
+        var yDoc = opts.getYDoc();
+        if (!yDoc || yDoc === boundDoc) return;
+        if (boundDoc) {
+          try { boundDoc.getMap(MAP_NAME).unobserve(onMapChange); } catch (e) {}
+          // proofs and deferred notes were established against the OLD doc: retire them
+          epoch++;
+          lastMirrored = null;
+          pendingCheckpoint = null;
+        }
+        boundDoc = yDoc;
+        try {
+          yDoc.getMap(MAP_NAME).observe(onMapChange);
+          // the replacement doc may already hold a newer checkpoint we missed while unbound
+          var entry = mapEntry();
+          if (entry && newer(entry, current)) applyCheckpoint(entry, "room");
+          else if (entry) reconcileTextOnly(entry); // equal-version: still fix the badge (joined a saved room)
+        } catch (e) { console.error("checkpoint observer attach failed:", e); }
+      },
+
+      _internals: { applyCheckpoint: applyCheckpoint, normalizeCheckpoint: normalizeCheckpoint, checkRoomDivergence: checkRoomDivergence, mapEntry: mapEntry, reconcileTextOnly: reconcileTextOnly, epoch: function () { return epoch; } },
+    };
+    return api;
+  }
+
+  window.PerchanceSaveCheckpoints = { createCheckpointManager: createCheckpointManager };
+})();
